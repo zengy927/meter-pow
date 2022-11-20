@@ -9,8 +9,13 @@
 #include <chain.h>
 #include <primitives/block.h>
 #include <uint256.h>
+#include <util.h>
+#include <miner.h>
 
-unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
+int g_nZawyLwmaWindowStartHeight=0;
+unsigned int Lwma4CalculateNextWorkRequired(const CBlockIndex* pindexLast,  const CBlockHeader* pblock, const Consensus::Params& params);
+
+unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
     int nHeight = pindexLast->nHeight + 1;
@@ -22,9 +27,10 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
         return nProofOfWorkLimit;
     }
 
-    return Lwma3CalculateNextWorkRequired(pindexLast, params);
+    return Lwma4CalculateNextWorkRequired(pindexLast, pblock, params);
 }
 
+#if 0
 // LWMA-1 for BTC/Zcash clones
 // LWMA has the best response*stability.  It rises slowly & drops fast when needed.  
 // Copyright (c) 2017-2018 The Bitcoin Gold developers
@@ -98,7 +104,167 @@ unsigned int Lwma3CalculateNextWorkRequired(const CBlockIndex* pindexLast, const
 
     nextTarget = avgTarget * sumWeightedSolvetimes; 
 
-    if (nextTarget > powLimit) { nextTarget = powLimit; }
+// LWMA-1 for BTC/Zcash clones
+// LWMA has the best response*stability.  It rises slowly & drops fast when needed.  
+// Copyright (c) 2017-2018 The Bitcoin Gold developers
+// Copyright (c) 2018-2019 Zawy 
+// Copyright (c) 2018 iamstenman (Microbitcoin)
+// MIT License
+// Algorithm by Zawy, a modification of WT-144 by Tom Harding
+// For any changes, patches, updates, etc see
+// https://github.com/zawy12/difficulty-algorithms/issues/3#issuecomment-442129791
+//  FTL should be lowered to about N*T/20.
+//  FTL in BTC clones is MAX_FUTURE_BLOCK_TIME in chain.h.
+//  FTL in Ignition, Numus, and others can be found in main.h as DRIFT.
+//  FTL in Zcash & Dash clones need to change the 2*60*60 here:
+//  if (block.GetBlockTime() > nAdjustedTime + 2 * 60 * 60)
+//  which is around line 3700 in main.cpp in ZEC and validation.cpp in Dash
+//  If your coin uses network time instead of node local time, lowering FTL < about 125% of the
+//  "revert to node time" rule (70 minutes in BCH, ZEC, & BTC) allows 33% Sybil attack,
+//  so revert rule must be ~ FTL/2 instead of 70 minutes. See:
+// https://github.com/zcash/zcash/issues/4021
+#endif
+unsigned int Lwma4CalculateNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* pblock, const Consensus::Params& params)
+{
+    const int64_t T = params.nPowTargetSpacing;
+
+   // For T=600, 300, 150 use approximately N=60, 90, 120
+    const int64_t N = params.nZawyLwmaAveragingWindow;  
+
+    // Define a k that will be used to get a proper average after weighting the solvetimes.
+    const int64_t k = N * (N + 1) * T / 2; 
+
+    const int64_t height = pindexLast->nHeight;
+    const arith_uint256 powLimit = UintToArith256(params.powLimit);
+	int64_t diffTime;
+	int nStartHeight=0;
+	int nWindowSize=0;
+    
+   // New coins should just give away first N blocks before using this algorithm.
+    if (height < N) { return powLimit.GetCompact(); }
+
+    arith_uint256 avgTarget, nextTarget;
+    int64_t thisTimestamp, previousTimestamp;
+    int64_t sumWeightedSolvetimes = 0, j = 0;
+	arith_uint256 target;
+	uint32_t currnBits,nextnBits;
+	double currDifficulty,nextDifficulty;
+
+    const CBlockIndex* blockPreviousTimestamp;
+ 
+
+	nStartHeight=g_nZawyLwmaWindowStartHeight+N-1<=height?height - N + 1:g_nZawyLwmaWindowStartHeight;
+	nWindowSize = height - nStartHeight + 1;
+	
+	blockPreviousTimestamp = pindexLast->GetAncestor(height - nWindowSize);
+	previousTimestamp = blockPreviousTimestamp->GetBlockTime();
+		
+		
+    // Loop through N most recent blocks. 
+    for (int64_t i = nStartHeight; i <= height; i++) {
+        const CBlockIndex* block = pindexLast->GetAncestor(i);
+
+        // Prevent solvetimes from being negative in a safe way. It must be done like this. 
+        // In particular, do not attempt anything like  if(solvetime < 0) {solvetime=0;}
+        // The +1 ensures new coins do not calculate nextTarget = 0.
+        thisTimestamp = (block->GetBlockTime() > previousTimestamp) ? 
+                            block->GetBlockTime() : previousTimestamp + 1;
+
+       // A 6*T limit will prevent large drops in difficulty from long solvetimes.
+//        int64_t solvetime = std::min(6 * T, thisTimestamp - previousTimestamp);
+        int64_t solvetime = thisTimestamp - previousTimestamp;
+
+       // The following is part of "preventing negative solvetimes". 
+        previousTimestamp = thisTimestamp;
+       
+       // Give linearly higher weight to more recent solvetimes.
+        j++;
+        sumWeightedSolvetimes += solvetime * j; 
+
+        target.SetCompact(block->nBits);
+        avgTarget += target / nWindowSize; // Dividing by nWindowSize here prevents an overflow below.
+    }
+   // Desired equation in next line was nextTarget = avgTarget * sumWeightSolvetimes / k
+   // but 1/k was moved to line above to prevent overflow in new coins
+
+    nextTarget = avgTarget * sumWeightedSolvetimes/(nWindowSize * (nWindowSize + 1) * T / 2); 
+	
+	
+	LogPrintf("nStartHeight:%d,nWindowSize:%d\r\n",nStartHeight,nWindowSize);
+
+	if ((pblock->nTime -pindexLast->nTime)>params.nPowTargetTimespan)
+	{ 
+
+		LogPrintf(" Enter self trig nextTarget adjustment\r\n");
+		if(height>params.nZawyLwmaAveragingWindow)
+		{
+			nextTarget.SetCompact(pindexLast->GetAncestor(height-params.nZawyLwmaAveragingWindow)->nBits);
+		}
+		else
+		{
+			nextTarget= powLimit;
+		}			
+
+		g_nZawyLwmaWindowStartHeight = height;
+		return nextTarget.GetCompact();
+	}
+
+	if(nWindowSize<10) 
+	{
+	
+		LogPrintf("Enter (nWindowSize<10) \r\n");
+		 if (nextTarget > powLimit) 
+		{ 
+			nextTarget = powLimit;		
+		}
+		  
+		  return nextTarget.GetCompact();
+	}
+		
+	//process exception
+	int64_t avgNTime= (pindexLast->GetBlockTime() - blockPreviousTimestamp->GetBlockTime())/nWindowSize;
+	int64_t avg10Time= (pindexLast->GetBlockTime() - pindexLast->GetAncestor(height - 10)->GetBlockTime())/10;
+	target.SetCompact(pindexLast->nBits);
+
+	//up
+	if (avgNTime<T/2)
+	{
+		nextTarget= nextTarget*2/3;	//Speed up
+		LogPrintf("Enter avgNTime<T/2\r\n");
+	}
+	
+	//down
+	if (avg10Time>4*T)
+	{
+		nextTarget= nextTarget*4;
+		
+		LogPrintf("Enter avgNTime>4*T\r\n");
+	}
+	else if (avgNTime>2*T)
+	{
+		nextTarget= nextTarget*3/2;
+		LogPrintf("Enter avgNTime>2*T\r\n");
+	}
+	
+
+    if (nextTarget > powLimit) 
+	{ 
+		LogPrintf("Enter nextTarget = powLimit\r\n");
+		nextTarget = powLimit;		
+	}
+
+
+	/*test */
+	if(height==20||height==40){nextTarget=nextTarget/1024;}
+	currnBits=target.GetCompact();
+	currDifficulty=GetDifficultyBynBits(currnBits);
+	nextnBits=nextTarget.GetCompact();
+	nextDifficulty=GetDifficultyBynBits(nextnBits);
+	
+	diffTime = pindexLast->GetBlockTime() - pindexLast->GetAncestor(height - 10)->GetBlockTime();
+	
+	LogPrintf("LWMA4 H:%ld,diffTime10:%lld CurrBlk[T:%ld,nBits:%ld Dificulty:%f],NextBlk[nBits:%ld ,Dificulty:%f]\r\n", height,diffTime,pindexLast->GetBlockTime(),currnBits,currDifficulty,nextnBits,nextDifficulty);
+	
 
     return nextTarget.GetCompact();
 }
